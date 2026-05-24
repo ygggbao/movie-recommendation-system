@@ -1,11 +1,10 @@
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify, g, send_from_directory
 from flask_cors import CORS
 import sqlite3
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
 import sys
 import hashlib
 import time
@@ -22,9 +21,23 @@ import os
 os.chdir(Path(__file__).parent.parent)
 
 DATABASE = "database/movie_ratings.db"
+BASE_DIR = Path(__file__).resolve().parent.parent
+FRONTEND_DIR = BASE_DIR / "frontend"
+MODEL_DIR = Path("models")
+ITEMCF_CACHE_FILES = ("itemcf_similarity.npy", "itemcf_data.pkl")
+NEURAL_CACHE_FILES = ("neural_model.pt", "neural_data.pkl")
 
 itemcf_model = None
 neural_model = None
+
+
+def cache_exists(model_dir, file_names):
+    return all((model_dir / file_name).exists() for file_name in file_names)
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return send_from_directory(FRONTEND_DIR, "index_v2.html")
 
 
 def log_search(user_id, query, search_type, result_count):
@@ -45,10 +58,19 @@ def log_recommendation(user_id, recs, algorithm):
     try:
         conn = sqlite3.connect(DATABASE)
         cursor = conn.cursor()
-        rec_ids = ",".join(str(r["movie_id"]) for r in recs)
-        cursor.execute(
-            "INSERT INTO recommendations (user_id, movie_ids, algorithm, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, rec_ids, algorithm, datetime.now().isoformat()),
+        rows = [
+            (
+                user_id,
+                rec["movie_id"],
+                rec.get("score"),
+                algorithm,
+                datetime.now().isoformat(),
+            )
+            for rec in recs
+        ]
+        cursor.executemany(
+            "INSERT INTO recommendations (user_id, movie_id, predicted_rating, algorithm, created_at) VALUES (?, ?, ?, ?, ?)",
+            rows,
         )
         conn.commit()
         conn.close()
@@ -665,53 +687,60 @@ def add_rating():
 
 def load_models():
     global itemcf_model, neural_model
+    import time
+    start_time = time.time()
+    model_dir = MODEL_DIR
 
+    # ItemCF
     print("Loading ItemCF model...")
     try:
-        conn = sqlite3.connect(DATABASE)
-        ratings_df = pd.read_sql_query("SELECT user_id, movie_id, rating FROM ratings", conn)
-        conn.close()
-
-        itemcf_model = ItemCF()
-        itemcf_model.build_user_item_matrix(ratings_df)
-        itemcf_model.compute_similarity("cosine")
-        print("ItemCF model loaded successfully")
+        if cache_exists(model_dir, ITEMCF_CACHE_FILES):
+            itemcf_model = ItemCF()
+            itemcf_model.load(str(model_dir))
+            print("ItemCF loaded from disk")
+        else:
+            print("ItemCF cache missing. Training once and saving to disk...")
+            conn = sqlite3.connect(DATABASE)
+            ratings_df = pd.read_sql_query("SELECT user_id, movie_id, rating FROM ratings", conn)
+            conn.close()
+            print(f"ItemCF training from {len(ratings_df)} ratings...")
+            itemcf_model = ItemCF()
+            itemcf_model.build_user_item_matrix(ratings_df)
+            itemcf_model.compute_similarity("cosine")
+            itemcf_model.save(str(model_dir))
+            print("ItemCF trained and saved")
     except Exception as e:
         print(f"ItemCF model load failed: {e}")
 
+    # Neural Network
     print("Loading Neural Network model...")
     try:
-        neural_model = NeuralCF(embedding_dim=32, hidden_layers=[64, 32], learning_rate=0.001)
-        ratings_df = neural_model.load_data()
-
-        n_users = len(neural_model.user_id_map)
-        n_movies = len(neural_model.movie_id_map)
-
-        neural_model.build_model(n_users, n_movies)
-
-        train_data, test_data = train_test_split(ratings_df, test_size=0.2, random_state=42)
-
-        train_dataset = MovieRatingDataset(
-            train_data["user_idx"].values.copy(),
-            train_data["movie_idx"].values.copy(),
-            train_data["rating"].values.copy()
-        )
-        test_dataset = MovieRatingDataset(
-            test_data["user_idx"].values.copy(),
-            test_data["movie_idx"].values.copy(),
-            test_data["rating"].values.copy()
-        )
-
-        train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
-
-        neural_model.train(train_loader, test_loader, epochs=10, verbose=True)
-        print("Neural Network model loaded successfully")
-
+        if cache_exists(model_dir, NEURAL_CACHE_FILES):
+            neural_model = NeuralCF()
+            neural_model.load(str(model_dir))
+            print("Neural model loaded from disk")
+        else:
+            print("Neural cache missing. Training once and saving to disk...")
+            neural_model = NeuralCF(embedding_dim=64, hidden_layers=[128, 64], learning_rate=0.001)
+            ratings_df = neural_model.load_data()
+            n_users = len(neural_model.user_id_map)
+            n_movies = len(neural_model.movie_id_map)
+            neural_model.build_model(n_users, n_movies)
+            train_loader, test_loader = neural_model.prepare_data(
+                ratings_df,
+                test_size=0.2,
+                batch_size=512,
+            )
+            neural_model.train(train_loader, test_loader, epochs=15, verbose=True)
+            neural_model.save(str(model_dir))
+            print("Neural model trained and saved")
     except Exception as e:
         print(f"Neural Network model load failed: {e}")
         import traceback
         traceback.print_exc()
+
+    elapsed = time.time() - start_time
+    print(f"Model loading completed in {elapsed:.1f}s")
 
 
 if __name__ == "__main__":
