@@ -78,6 +78,79 @@ def log_recommendation(user_id, recs, algorithm):
         pass
 
 
+def get_user_rating_pairs(user_id):
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT movie_id, rating FROM ratings WHERE user_id = ?", (user_id,))
+    ratings = [{"movie_id": row[0], "rating": row[1]} for row in cursor.fetchall()]
+    conn.close()
+    return ratings
+
+
+def get_popular_recommendations(limit=10, excluded_movie_ids=None):
+    excluded_movie_ids = set(excluded_movie_ids or [])
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+
+    conditions = ["avg_rating IS NOT NULL", "rating_count >= 50"]
+    params = []
+    if excluded_movie_ids:
+        placeholders = ",".join(["?"] * len(excluded_movie_ids))
+        conditions.append(f"movie_id NOT IN ({placeholders})")
+        params.extend(excluded_movie_ids)
+
+    query = (
+        "SELECT movie_id, avg_rating FROM movies WHERE "
+        + " AND ".join(conditions)
+        + " ORDER BY avg_rating DESC, rating_count DESC LIMIT ?"
+    )
+    cursor.execute(query, params + [limit])
+    recommendations = [
+        {"movie_id": row[0], "score": round(row[1] or 0, 2)}
+        for row in cursor.fetchall()
+    ]
+    conn.close()
+    return recommendations
+
+
+def format_itemcf_recommendations(recommendations):
+    return [
+        {"movie_id": rec["movie_id"], "score": round(rec["predicted_rating"], 2)}
+        for rec in recommendations
+    ]
+
+
+def apply_recommendation_fallback(user_id, formatted_recs, algorithm_name, num_recommendations):
+    if formatted_recs:
+        return formatted_recs, algorithm_name, "personalized", None
+
+    user_ratings = get_user_rating_pairs(user_id)
+    rated_movie_ids = [row["movie_id"] for row in user_ratings]
+
+    if user_ratings and itemcf_model is not None:
+        online_recs = itemcf_model.recommend_from_ratings(
+            user_ratings,
+            k=20,
+            n_recommendations=num_recommendations,
+        )
+        formatted_recs = format_itemcf_recommendations(online_recs)
+        if formatted_recs:
+            return (
+                formatted_recs,
+                algorithm_name + " + ItemCF Online",
+                "online_profile",
+                "该用户不在离线模型中，已根据实时评分生成推荐。",
+            )
+
+    popular_recs = get_popular_recommendations(num_recommendations, rated_movie_ids)
+    return (
+        popular_recs,
+        algorithm_name + " + Cold Start",
+        "cold_start",
+        "该用户评分较少，已为你展示热门高分电影。",
+    )
+
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy", "message": "Movie Recommendation System is running"})
@@ -121,10 +194,17 @@ def get_stats():
         cursor.execute("SELECT rating, COUNT(*) FROM ratings GROUP BY rating ORDER BY rating")
         rating_distribution = {str(row[0]): row[1] for row in cursor.fetchall()}
 
-        cursor.execute(
-            "SELECT genres, COUNT(*) as cnt FROM movies WHERE genres IS NOT NULL GROUP BY genres ORDER BY cnt DESC LIMIT 10"
-        )
-        top_genres = [{"genres": row[0], "count": row[1]} for row in cursor.fetchall()]
+        cursor.execute("SELECT genres FROM movies WHERE genres IS NOT NULL")
+        genre_counts = {}
+        for (genres_str,) in cursor.fetchall():
+            for genre in str(genres_str).split("|"):
+                genre = genre.strip()
+                if genre:
+                    genre_counts[genre] = genre_counts.get(genre, 0) + 1
+        top_genres = [
+            {"genre": genre, "count": count}
+            for genre, count in sorted(genre_counts.items(), key=lambda item: item[1], reverse=True)[:10]
+        ]
 
         conn.close()
 
@@ -374,17 +454,37 @@ def get_recommendations(user_id):
             if itemcf_model is None:
                 return jsonify({"error": "ItemCF model not loaded"}), 500
 
-            recommendations = itemcf_model.recommend(user_id, k=20, n_recommendations=num_recommendations)
-            formatted_recs = [
-                {"movie_id": rec["movie_id"], "score": round(rec["predicted_rating"], 2)}
-                for rec in recommendations
-            ]
+            user_ratings = get_user_rating_pairs(user_id)
+            if user_ratings:
+                recommendations = itemcf_model.recommend_from_ratings(
+                    user_ratings,
+                    k=20,
+                    n_recommendations=num_recommendations,
+                )
+                source = "online_profile"
+            else:
+                recommendations = itemcf_model.recommend(user_id, k=20, n_recommendations=num_recommendations)
+                source = "cached_profile"
 
-            log_recommendation(user_id, formatted_recs, "ItemCF")
+            formatted_recs = format_itemcf_recommendations(recommendations)
+            message = None
+            if not formatted_recs:
+                formatted_recs, algorithm_name, source, message = apply_recommendation_fallback(
+                    user_id,
+                    formatted_recs,
+                    "ItemCF",
+                    num_recommendations,
+                )
+            else:
+                algorithm_name = "ItemCF"
+
+            log_recommendation(user_id, formatted_recs, algorithm_name)
 
             return jsonify({
                 "user_id": user_id,
-                "algorithm": "ItemCF",
+                "algorithm": algorithm_name,
+                "source": source,
+                "message": message,
                 "recommendations": formatted_recs,
             })
 
@@ -403,12 +503,20 @@ def get_recommendations(user_id):
                 {"movie_id": rec[0], "score": round(rec[1], 2)}
                 for rec in recommendations
             ]
+            formatted_recs, algorithm_name, source, message = apply_recommendation_fallback(
+                user_id,
+                formatted_recs,
+                "Neural Network",
+                num_recommendations,
+            )
 
-            log_recommendation(user_id, formatted_recs, "Neural Network")
+            log_recommendation(user_id, formatted_recs, algorithm_name)
 
             return jsonify({
                 "user_id": user_id,
-                "algorithm": "Neural Network",
+                "algorithm": algorithm_name,
+                "source": source,
+                "message": message,
                 "recommendations": formatted_recs,
             })
         else:

@@ -112,6 +112,60 @@ class ItemCF:
             )
         return result
 
+    def recommend_from_ratings(self, user_ratings, k=10, n_recommendations=10):
+        if self.item_similarity is None:
+            raise ValueError("Please compute or load item similarity first")
+
+        ratings_by_idx = {}
+        for row in user_ratings:
+            movie_id = row.get("movie_id") if isinstance(row, dict) else row[0]
+            rating = row.get("rating") if isinstance(row, dict) else row[1]
+            if movie_id in self.movie_id_map and rating and float(rating) > 0:
+                ratings_by_idx[self.movie_id_map[movie_id]] = float(rating)
+
+        if not ratings_by_idx:
+            return []
+
+        rated_indices = np.array(list(ratings_by_idx.keys()), dtype=int)
+        rated_values = np.array(list(ratings_by_idx.values()), dtype=float)
+        rated_index_set = set(ratings_by_idx)
+        recommendations = []
+
+        for item_idx in range(self.item_similarity.shape[0]):
+            if item_idx in rated_index_set:
+                continue
+
+            similarities = self.item_similarity[item_idx][rated_indices]
+            positive_mask = similarities > 0
+            if not np.any(positive_mask):
+                continue
+
+            similarities = similarities[positive_mask]
+            values = rated_values[positive_mask]
+            if len(similarities) > k:
+                top_idx = np.argsort(similarities)[::-1][:k]
+                similarities = similarities[top_idx]
+                values = values[top_idx]
+
+            similarity_sum = np.abs(similarities).sum()
+            if similarity_sum <= 0:
+                continue
+
+            predicted_rating = float(np.dot(similarities, values) / similarity_sum)
+            recommendations.append((item_idx, predicted_rating))
+
+        recommendations.sort(key=lambda x: x[1], reverse=True)
+
+        result = []
+        for item_idx, predicted_rating in recommendations[:n_recommendations]:
+            result.append(
+                {
+                    "movie_id": self.reverse_movie_map[item_idx],
+                    "predicted_rating": max(1.0, min(5.0, predicted_rating)),
+                }
+            )
+        return result
+
     def save(self, model_dir="models"):
         if self.item_similarity is None or self.user_item_matrix is None:
             raise ValueError("ItemCF model is not ready to save")
